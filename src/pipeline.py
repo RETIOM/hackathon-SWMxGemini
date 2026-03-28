@@ -1,11 +1,8 @@
-"""Pipeline — Wires the ChunkingIngestor to the StreamingAINarrator.
+"""Pipeline orchestration for described video output.
 
-Usage:
-    uv run src/pipeline.py <video_file> [--project-id <id>] [--output-dir <dir>]
-
-Reads a video file, chunks it into 5-second blocks via the ingestor,
-generates audio descriptions for each chunk via the narrator, and saves
-the resulting MP3 files sequentially.
+Supports two output modes controlled by a flag:
+- segmented: yields one self-contained fMP4 segment per chunk
+- single_file: yields one final MP4 after end-of-stream
 """
 
 from __future__ import annotations
@@ -14,39 +11,152 @@ import argparse
 import asyncio
 import logging
 import os
-import sys
 import pathlib
+import sys
+from dataclasses import dataclass
+from typing import Any, AsyncIterator, Literal, cast
 
-# Ensure both sibling packages are importable
+# Ensure sibling packages are importable
 _src_dir = str(pathlib.Path(__file__).resolve().parent)
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
 from ingestor.ingestor import ChunkingIngestor
-from narrator.narrator import StreamingAINarrator, NarratorResult
+from narrator.narrator import NarratorResult, StreamingAINarrator
+from synchronizer import Synchronizer
 
 logger = logging.getLogger(__name__)
+
+OutputMode = Literal["segmented", "single_file", "segmented_with_text"]
+
+
+@dataclass(slots=True)
+class DescribedVideoPipeline:
+    """Runs the full ingestor + narrator + VAP + synchronizer flow."""
+
+    ingestor: Any
+    narrator: Any
+    vap: Any
+    synchronizer: Any
+    output_mode: OutputMode = "segmented"
+    queue_timeout_s: float = 30.0
+
+    async def run(self) -> AsyncIterator[bytes | tuple[bytes, str]]:
+        """Yield output MP4 bytes according to the configured output mode."""
+        if self.output_mode not in ("segmented", "single_file", "segmented_with_text"):
+            raise ValueError(f"Unsupported output_mode: {self.output_mode}")
+
+        segments: list[bytes] = []
+        self.ingestor.start()
+
+        sync_task = None
+        pending_text = ""
+
+        try:
+            while True:
+                chunk = await asyncio.to_thread(
+                    self.ingestor.processing_queue.get,
+                    timeout=self.queue_timeout_s,
+                )
+
+                if chunk is None:
+                    logger.info("End-of-stream sentinel received.")
+                    # Flush the final sync task
+                    if sync_task:
+                        segment = await sync_task
+                        if self.output_mode == "segmented":
+                            yield segment
+                        elif self.output_mode == "segmented_with_text":
+                            yield segment, pending_text
+                        else:
+                            segments.append(segment)
+                    break
+
+                # Start Gemini for CURRENT chunk immediately
+                model_task = asyncio.create_task(self._process_chunk_models(chunk))
+
+                # While Gemini runs, wait for PREVIOUS chunk's synchronizer to finish and yield it
+                if sync_task:
+                    segment = await sync_task
+                    if self.output_mode == "segmented":
+                        yield segment
+                    elif self.output_mode == "segmented_with_text":
+                        yield segment, pending_text
+                    else:
+                        segments.append(segment)
+
+                # Now wait for CURRENT chunk's Gemini to finish
+                narrator_result, vap_masks = await model_task
+
+                # Start the synchronizer for CURRENT chunk in background
+                sync_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self.synchronizer.process,
+                        chunk,
+                        narrator_result,
+                        vap_masks,
+                    )
+                )
+                pending_text = narrator_result.text
+
+            if self.output_mode == "single_file":
+                final_mp4 = await asyncio.to_thread(self.synchronizer.concat_segments, segments)
+                if final_mp4:
+                    yield final_mp4
+        finally:
+            self.ingestor.stop()
+
+    async def _process_chunk_models(self, chunk) -> tuple[NarratorResult, list[float]]:
+        narrator_task = self.narrator.process_media_chunk(chunk)
+        vap_task = asyncio.to_thread(self.vap.process_chunk, chunk)
+
+        narrator_res, vap_res = await asyncio.gather(
+            narrator_task,
+            vap_task,
+            return_exceptions=True,
+        )
+
+        if isinstance(narrator_res, Exception):
+            logger.warning("Narrator failed for chunk; using silent fallback", exc_info=True)
+            narrator_res = self._silent_result()
+
+        if isinstance(vap_res, Exception):
+            logger.warning("VAP failed for chunk; using no-duck masks", exc_info=True)
+            vap_res = [1.0] * len(chunk.raw_video_frames)
+
+        if not isinstance(vap_res, list):
+            vap_res = [1.0] * len(chunk.raw_video_frames)
+
+        if len(vap_res) < len(chunk.raw_video_frames):
+            vap_res = vap_res + [1.0] * (len(chunk.raw_video_frames) - len(vap_res))
+        elif len(vap_res) > len(chunk.raw_video_frames):
+            vap_res = vap_res[: len(chunk.raw_video_frames)]
+
+        return cast(NarratorResult, narrator_res), [float(v) for v in vap_res]
+
+    def _silent_result(self) -> NarratorResult:
+        if hasattr(self.narrator, "_generate_silent_audio"):
+            try:
+                return NarratorResult(
+                    audio_bytes=self.narrator._generate_silent_audio(),
+                    text="",
+                )
+            except Exception:
+                logger.warning("Failed to generate narrator silence", exc_info=True)
+        return NarratorResult(audio_bytes=b"", text="")
 
 
 async def run_pipeline(
     video_path: str,
     project_id: str,
     output_dir: str,
-    chunk_duration: float = 10.0,
+    chunk_duration: float = 5.0,
     simulate_realtime: bool = False,
-) -> list[NarratorResult]:
-    """Run the full ingestor → narrator pipeline.
+    output_mode: OutputMode = "segmented",
+) -> list[str]:
+    """Run the full merged-media pipeline and write outputs to disk."""
+    from ingestor.vap import VAP
 
-    Args:
-        video_path: Path to the input video file.
-        project_id: GCP project ID for Gemini and TTS.
-        output_dir: Directory to write output MP3 files.
-        chunk_duration: Duration of each chunk in seconds.
-        simulate_realtime: If True, the ingestor waits in real-time between chunks.
-
-    Returns:
-        List of NarratorResult objects, one per chunk.
-    """
     os.makedirs(output_dir, exist_ok=True)
 
     ingestor = ChunkingIngestor(
@@ -57,58 +167,45 @@ async def run_pipeline(
     narrator = StreamingAINarrator(project_id=project_id)
     await narrator.warmup()
 
-    ingestor.start()
-    results: list[NarratorResult] = []
+    pipeline = DescribedVideoPipeline(
+        ingestor=ingestor,
+        narrator=narrator,
+        vap=VAP(),
+        synchronizer=Synchronizer(),
+        output_mode=output_mode,
+    )
+
+    saved_paths: list[str] = []
     chunk_num = 0
-
-    try:
-        while True:
-            # Bridge: blocking queue.get() → async via asyncio.to_thread
-            chunk = await asyncio.to_thread(
-                ingestor.processing_queue.get, timeout=30.0
-            )
-
-            # None sentinel = end of stream
-            if chunk is None:
-                logger.info("End-of-stream sentinel received.")
-                break
-
+    async for payload in pipeline.run():
+        if output_mode == "segmented":
             chunk_num += 1
-            logger.info(
-                "Chunk %d received [%.1fs–%.1fs] (%d frames)",
-                chunk_num,
-                chunk.start_time,
-                chunk.end_time,
-                len(chunk.compressed_frames),
-            )
+            out_path = os.path.join(output_dir, f"segment_{chunk_num:03d}.mp4")
+        else:
+            out_path = os.path.join(output_dir, "final.mp4")
 
-            # Run narrator
-            result = await narrator.process_media_chunk(chunk)
-            results.append(result)
+        with open(out_path, "wb") as f:
+            f.write(payload)
 
-            # Save MP3
-            mp3_path = os.path.join(output_dir, f"chunk_{chunk_num:03d}.mp3")
-            with open(mp3_path, "wb") as f:
-                f.write(result.audio_bytes)
+        saved_paths.append(out_path)
+        logger.info("Wrote output: %s", out_path)
 
-            status = f"'{result.text}'" if result.text else "(silent fallback)"
-            print(f"  [{chunk.start_time:.1f}s–{chunk.end_time:.1f}s] {status} → {mp3_path}")
-
-    except Exception as e:
-        logger.error("Pipeline error: %s", e, exc_info=True)
-    finally:
-        ingestor.stop()
-
-    print(f"\nDone — {chunk_num} chunks processed, {len(results)} audio files saved to {output_dir}/")
-    return results
+    return saved_paths
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Video → Audio Description Pipeline")
+    parser = argparse.ArgumentParser(description="Described video pipeline")
     parser.add_argument("video_file", help="Path to the input video file")
     parser.add_argument("--project-id", default="swmxgemini", help="GCP project ID")
-    parser.add_argument("--output-dir", default="pipeline_output", help="Output directory for MP3 files")
-    parser.add_argument("--realtime", action="store_true", help="Simulate real-time playback speed")
+    parser.add_argument("--output-dir", default="pipeline_output", help="Output directory")
+    parser.add_argument(
+        "--output-mode",
+        choices=["segmented", "single_file"],
+        default="segmented",
+        help="Output mode: chunk segments or one final file",
+    )
+    parser.add_argument("--chunk-duration", type=float, default=10.0, help="Chunk duration in seconds")
+    parser.add_argument("--realtime", action="store_true", help="Simulate real-time ingestion")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -116,14 +213,19 @@ def main() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
-    asyncio.run(
+    outputs = asyncio.run(
         run_pipeline(
             video_path=args.video_file,
             project_id=args.project_id,
             output_dir=args.output_dir,
+            chunk_duration=args.chunk_duration,
             simulate_realtime=args.realtime,
+            output_mode=args.output_mode,
         )
     )
+
+    for path in outputs:
+        print(path)
 
 
 if __name__ == "__main__":
