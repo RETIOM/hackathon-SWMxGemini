@@ -76,13 +76,6 @@ GEMINI_MODEL: str = "gemini-2.5-flash"
 VISION_PROMPT_TEMPLATE: str = (
     "{context_clause}"
     "Describe the continuous action in these sequential frames. "
-    "CRITICAL: Write ONE sentence. Maximum 10 words. "
-    "Focus only on physical movement."
-)
-
-VISION_PROMPT_TEMPLATE: str = (
-    "{context_clause}"
-    "Describe the continuous action in these sequential frames. "
     "CRITICAL: Write AT MOST 30 words."
     "Focus only on physical movement."
 )

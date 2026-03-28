@@ -113,7 +113,11 @@ class ChunkingIngestor:
                         accumulated_jpegs.append(mem_file.getvalue())
 
                     elif isinstance(frame, av.audio.frame.AudioFrame):
-                        # Rapidly cache audio payload slices as completely uncompressed raw bytes natively
+                        # Contract: each frame contributes float32 planar samples from
+                        # frame.to_ndarray() (shape is typically [channels, samples]).
+                        # Concatenation preserves this per-frame channel-major ordering.
+                        # Downstream VAP/Synchronizer should decode raw_audio_bytes as
+                        # float32 with channel count from chunk.audio_channels.
                         accumulated_audio_frames.append(frame.to_ndarray().tobytes())
 
             # Yield whatever uncompleted trailing chunk remains at the very end of the file safely
