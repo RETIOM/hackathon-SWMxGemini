@@ -48,10 +48,14 @@ class ChunkingIngestor:
             streams = [v_stream]
             audio_rate = 48000
             audio_channels = 2
+            resampler = None
+
             if a_stream:
                 streams.append(a_stream)
-                audio_rate = a_stream.rate
-                audio_channels = a_stream.channels
+                # Force standardized output: interleaved float32, stereo, at native rate
+                audio_rate = a_stream.rate if a_stream.rate else 48000
+                audio_channels = 2
+                resampler = av.AudioResampler(format="flt", layout="stereo", rate=audio_rate)
 
             start_wall_time = time.time()
             current_chunk_start = 0.0
@@ -113,12 +117,12 @@ class ChunkingIngestor:
                         accumulated_jpegs.append(mem_file.getvalue())
 
                     elif isinstance(frame, av.audio.frame.AudioFrame):
-                        # Contract: each frame contributes float32 planar samples from
-                        # frame.to_ndarray() (shape is typically [channels, samples]).
-                        # Concatenation preserves this per-frame channel-major ordering.
-                        # Downstream VAP/Synchronizer should decode raw_audio_bytes as
-                        # float32 with channel count from chunk.audio_channels.
-                        accumulated_audio_frames.append(frame.to_ndarray().tobytes())
+                        if resampler:
+                            resampled_frames = resampler.resample(frame)
+                            for r_frame in resampled_frames:
+                                accumulated_audio_frames.append(r_frame.to_ndarray().tobytes())
+                        else:
+                            accumulated_audio_frames.append(frame.to_ndarray().tobytes())
 
             # Yield whatever uncompleted trailing chunk remains at the very end of the file safely
             if accumulated_video_frames or accumulated_audio_frames:

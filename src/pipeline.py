@@ -27,7 +27,7 @@ from synchronizer import Synchronizer
 
 logger = logging.getLogger(__name__)
 
-OutputMode = Literal["segmented", "single_file"]
+OutputMode = Literal["segmented", "single_file", "segmented_with_text"]
 
 
 @dataclass(slots=True)
@@ -41,13 +41,16 @@ class DescribedVideoPipeline:
     output_mode: OutputMode = "segmented"
     queue_timeout_s: float = 30.0
 
-    async def run(self) -> AsyncIterator[bytes]:
+    async def run(self) -> AsyncIterator[bytes | tuple[bytes, str]]:
         """Yield output MP4 bytes according to the configured output mode."""
-        if self.output_mode not in ("segmented", "single_file"):
+        if self.output_mode not in ("segmented", "single_file", "segmented_with_text"):
             raise ValueError(f"Unsupported output_mode: {self.output_mode}")
 
         segments: list[bytes] = []
         self.ingestor.start()
+
+        sync_task = None
+        pending_text = ""
 
         try:
             while True:
@@ -58,20 +61,43 @@ class DescribedVideoPipeline:
 
                 if chunk is None:
                     logger.info("End-of-stream sentinel received.")
+                    # Flush the final sync task
+                    if sync_task:
+                        segment = await sync_task
+                        if self.output_mode == "segmented":
+                            yield segment
+                        elif self.output_mode == "segmented_with_text":
+                            yield segment, pending_text
+                        else:
+                            segments.append(segment)
                     break
 
-                narrator_result, vap_masks = await self._process_chunk_models(chunk)
-                segment = await asyncio.to_thread(
-                    self.synchronizer.process,
-                    chunk,
-                    narrator_result,
-                    vap_masks,
-                )
+                # Start Gemini for CURRENT chunk immediately
+                model_task = asyncio.create_task(self._process_chunk_models(chunk))
 
-                if self.output_mode == "segmented":
-                    yield segment
-                else:
-                    segments.append(segment)
+                # While Gemini runs, wait for PREVIOUS chunk's synchronizer to finish and yield it
+                if sync_task:
+                    segment = await sync_task
+                    if self.output_mode == "segmented":
+                        yield segment
+                    elif self.output_mode == "segmented_with_text":
+                        yield segment, pending_text
+                    else:
+                        segments.append(segment)
+
+                # Now wait for CURRENT chunk's Gemini to finish
+                narrator_result, vap_masks = await model_task
+
+                # Start the synchronizer for CURRENT chunk in background
+                sync_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self.synchronizer.process,
+                        chunk,
+                        narrator_result,
+                        vap_masks,
+                    )
+                )
+                pending_text = narrator_result.text
 
             if self.output_mode == "single_file":
                 final_mp4 = await asyncio.to_thread(self.synchronizer.concat_segments, segments)
@@ -178,7 +204,7 @@ def main() -> None:
         default="segmented",
         help="Output mode: chunk segments or one final file",
     )
-    parser.add_argument("--chunk-duration", type=float, default=5.0, help="Chunk duration in seconds")
+    parser.add_argument("--chunk-duration", type=float, default=10.0, help="Chunk duration in seconds")
     parser.add_argument("--realtime", action="store_true", help="Simulate real-time ingestion")
     args = parser.parse_args()
 

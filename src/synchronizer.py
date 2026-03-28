@@ -49,7 +49,7 @@ class Synchronizer:
             output_buffer,
             mode="w",
             format="mp4",
-            options={"movflags": self.movflags},
+            container_options={"movflags": self.movflags},
         )
 
         out_video_stream: Any = None
@@ -74,8 +74,8 @@ class Synchronizer:
                         if audio_streams:
                             first_a = cast(Any, audio_streams[0])
                             out_audio_stream = out_container.add_stream(self.audio_codec, rate=first_a.rate or 48000)
-                            if first_a.layout is not None:
-                                out_audio_stream.layout = first_a.layout.name
+                            if first_a.channels:
+                                out_audio_stream.layout = "stereo" if first_a.channels >= 2 else "mono"
 
                     for frame in in_container.decode(video=0):
                         frame.pts = None
@@ -129,6 +129,12 @@ class Synchronizer:
 
         narration = self._decode_narration_audio(narrator_result, sample_rate, channels)
         if narration is not None:
+            # Pydub overlay truncates the overlaid track to the length of the base track.
+            # We must pad the base track with silence if the TTS is longer than the base!
+            if len(narration) > len(base):
+                silence = AudioSegment.silent(duration=len(narration) - len(base), frame_rate=sample_rate).set_channels(channels)
+                base = base + silence
+                
             base = base.overlay(narration)
 
         return self._fit_duration(base, target_duration_ms)
@@ -191,14 +197,8 @@ class Synchronizer:
         return narration.set_frame_rate(sample_rate).set_channels(channels)
 
     def _fit_duration(self, audio: AudioSegment, target_duration_ms: int) -> AudioSegment:
-        if len(audio) == target_duration_ms:
-            return audio
-        if len(audio) < target_duration_ms:
-            return audio + AudioSegment.silent(
-                duration=target_duration_ms - len(audio),
-                frame_rate=audio.frame_rate,
-            ).set_channels(audio.channels)
-        return cast(AudioSegment, audio[:target_duration_ms])
+        # If audio is longer, DO NOT truncate. Return as-is so video can be padded to match.
+        return audio
 
     def _mux_segment(self, chunk: MediaChunk, mixed_audio: AudioSegment | None, fps: int) -> bytes:
         output_buffer = io.BytesIO()
@@ -206,7 +206,7 @@ class Synchronizer:
             output_buffer,
             mode="w",
             format="mp4",
-            options={"movflags": self.movflags},
+            container_options={"movflags": self.movflags},
         )
 
         v0 = chunk.raw_video_frames[0]
@@ -226,25 +226,47 @@ class Synchronizer:
             in_audio_stream = cast(Any, next((s for s in wav_container.streams if s.type == "audio"), None))
             if in_audio_stream is not None:
                 audio_stream = container.add_stream(self.audio_codec, rate=in_audio_stream.rate or mixed_audio.frame_rate)
-                if in_audio_stream.layout is not None:
-                    audio_stream.layout = in_audio_stream.layout.name
+                if in_audio_stream.channels:
+                    audio_stream.layout = "stereo" if in_audio_stream.channels >= 2 else "mono"
 
+        frames_to_write = chunk.raw_video_frames
+        if mixed_audio is not None and len(mixed_audio) > 0:
+            target_duration_s = len(mixed_audio) / 1000.0
+            required_frames = int(round(target_duration_s * fps))
+            if len(frames_to_write) < required_frames:
+                last_frame = frames_to_write[-1]
+                frames_to_write = frames_to_write + [last_frame] * (required_frames - len(frames_to_write))
+
+        all_packets = []
         try:
-            for frame_ndarray in chunk.raw_video_frames:
+            for frame_ndarray in frames_to_write:
                 vf = av.VideoFrame.from_ndarray(frame_ndarray, format="rgb24")
                 for packet in video_stream.encode(vf):
-                    container.mux(packet)
+                    all_packets.append(packet)
 
             for packet in video_stream.encode():
-                container.mux(packet)
+                all_packets.append(packet)
 
             if audio_stream is not None and wav_container is not None:
                 for af in wav_container.decode(audio=0):
                     af.pts = None
                     for packet in audio_stream.encode(af):
-                        container.mux(packet)
+                        all_packets.append(packet)
                 for packet in audio_stream.encode():
-                    container.mux(packet)
+                    all_packets.append(packet)
+
+            # Sort packets by DTS (or PTS if DTS is missing) to correctly interleave the fragment
+            def get_timestamp(pkt):
+                if pkt.dts is not None:
+                    return pkt.dts * float(getattr(pkt.stream.time_base, "numerator", 1)) / float(getattr(pkt.stream.time_base, "denominator", 1))
+                if pkt.pts is not None:
+                    return pkt.pts * float(getattr(pkt.stream.time_base, "numerator", 1)) / float(getattr(pkt.stream.time_base, "denominator", 1))
+                return 0
+
+            all_packets.sort(key=get_timestamp)
+            
+            for packet in all_packets:
+                container.mux(packet)
         finally:
             if wav_container is not None:
                 wav_container.close()
