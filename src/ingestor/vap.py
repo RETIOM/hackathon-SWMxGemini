@@ -2,7 +2,7 @@ import torch
 import torchaudio
 import numpy as np
 from typing import List
-from models import MediaChunk
+from ingestor.models import MediaChunk
 
 class VAP:
     """

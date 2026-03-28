@@ -3,7 +3,7 @@ import queue
 import threading
 import io
 import time
-from models import MediaChunk
+from ingestor.models import MediaChunk
 
 class ChunkingIngestor:
     """

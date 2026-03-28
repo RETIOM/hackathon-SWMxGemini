@@ -4,6 +4,9 @@ Processes sequential video frames through a three-phase pipeline:
   1. Vision AI generates a short text description (Gemini)
   2. Text-to-Speech converts it to audio (Google Cloud TTS)
   3. Audio is mechanically fitted to a fixed duration window (Pydub)
+
+Integrates with :class:`~ingestor.models.MediaChunk` from the
+:mod:`ingestor` package for end-to-end video-to-narration pipelines.
 """
 
 from __future__ import annotations
@@ -12,6 +15,13 @@ import asyncio
 import io
 import logging
 from dataclasses import dataclass, field
+import sys
+import pathlib
+
+# Ensure the ingestor package is importable (sibling package under src/)
+_src_dir = str(pathlib.Path(__file__).resolve().parent.parent)
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
 
 from google import genai
 from google.cloud import texttospeech_v1
@@ -26,8 +36,13 @@ logger = logging.getLogger(__name__)
 
 from typing import TypeAlias
 
+from ingestor.models import MediaChunk
+
 JpegFrames: TypeAlias = list[bytes]
 """A list of compressed JPEG byte strings representing sequential video frames."""
+
+DEFAULT_SAMPLE_COUNT: int = 5
+"""Number of frames to sample from a MediaChunk for vision processing."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,10 +61,10 @@ class NarratorResult:
 # ---------------------------------------------------------------------------
 
 MAX_CONSECUTIVE_FAILURES: int = 3
-VISION_TIMEOUT: float = 6.0  # seconds
+VISION_TIMEOUT: float = 10.0  # seconds
 TTS_TIMEOUT: float = 4.0  # seconds
 
-DEFAULT_TARGET_DURATION_MS: int = 5000
+DEFAULT_TARGET_DURATION_MS: int = 10000
 DURATION_TOLERANCE_MS: int = 50
 
 TTS_VOICE_NAME: str = "en-US-Neural2-J"
@@ -65,6 +80,12 @@ VISION_PROMPT_TEMPLATE: str = (
     "Focus only on physical movement."
 )
 
+VISION_PROMPT_TEMPLATE: str = (
+    "{context_clause}"
+    "Describe the continuous action in these sequential frames. "
+    "CRITICAL: Write AT MOST 30 words."
+    "Focus only on physical movement."
+)
 
 # ---------------------------------------------------------------------------
 # StreamingAINarrator
@@ -112,6 +133,40 @@ class StreamingAINarrator:
             TTS_VOICE_NAME,
             self._target_duration_ms,
         )
+
+    async def warmup(self) -> None:
+        """Pre-establish API connections to avoid cold-start timeouts.
+
+        Sends a minimal request to both Gemini and TTS so that the first
+        real :meth:`process_chunk` call doesn't pay the connection setup cost.
+        """
+        logger.info("Warming up API connections...")
+
+        # Warm up Gemini
+        try:
+            await self._genai_client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents="Say OK.",
+            )
+            logger.info("Gemini warmup complete.")
+        except Exception as e:
+            logger.warning("Gemini warmup failed (non-fatal): %s", e)
+
+        # Warm up TTS
+        try:
+            await self._tts_client.synthesize_speech(
+                input=texttospeech_v1.SynthesisInput(text="OK"),
+                voice=texttospeech_v1.VoiceSelectionParams(
+                    language_code=TTS_LANGUAGE_CODE,
+                    name=TTS_VOICE_NAME,
+                ),
+                audio_config=texttospeech_v1.AudioConfig(
+                    audio_encoding=texttospeech_v1.AudioEncoding.MP3,
+                ),
+            )
+            logger.info("TTS warmup complete.")
+        except Exception as e:
+            logger.warning("TTS warmup failed (non-fatal): %s", e)
 
     # ------------------------------------------------------------------
     # Phase 1 — Vision AI
@@ -263,15 +318,33 @@ class StreamingAINarrator:
         return buffer.getvalue()
 
     # ------------------------------------------------------------------
+    # Frame Sampling
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sample_frames(
+        frames: JpegFrames, n: int = DEFAULT_SAMPLE_COUNT
+    ) -> JpegFrames:
+        """Select *n* evenly-spaced frames from *frames*.
+
+        If there are fewer than *n* frames available, all are returned.
+        """
+        total = len(frames)
+        if total <= n:
+            return frames
+        step = total / n
+        return [frames[int(i * step)] for i in range(n)]
+
+    # ------------------------------------------------------------------
     # Main Orchestrator
     # ------------------------------------------------------------------
 
     async def process_chunk(self, frames: JpegFrames) -> NarratorResult:
         """Process a batch of JPEG frames into narration audio.
 
-        This is the public entry-point called by the upstream ingestor.
-        It enforces strict timeouts on each API phase and falls back to
-        silence on any failure.
+        This is the low-level entry-point that accepts raw JPEG byte
+        lists.  Prefer :meth:`process_media_chunk` when working with
+        the ingestor pipeline.
 
         Args:
             frames: List of compressed JPEG byte strings.
@@ -322,3 +395,25 @@ class StreamingAINarrator:
                 audio_bytes=self._generate_silent_audio(),
                 text="",
             )
+
+    async def process_media_chunk(self, chunk: MediaChunk) -> NarratorResult:
+        """Process a :class:`MediaChunk` from the ingestor.
+
+        Samples a small number of evenly-spaced JPEG frames from
+        ``chunk.compressed_frames`` and delegates to :meth:`process_chunk`.
+
+        Args:
+            chunk: A ``MediaChunk`` produced by :class:`ChunkingIngestor`.
+
+        Returns:
+            A :class:`NarratorResult` with fitted audio and description text.
+        """
+        sampled = self._sample_frames(chunk.compressed_frames)
+        logger.info(
+            "Processing media chunk [%.1fs–%.1fs] (%d frames, sampled %d)",
+            chunk.start_time,
+            chunk.end_time,
+            len(chunk.compressed_frames),
+            len(sampled),
+        )
+        return await self.process_chunk(sampled)

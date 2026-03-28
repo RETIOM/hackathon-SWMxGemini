@@ -5,6 +5,7 @@ description = "Hackathon Project"
 readme = "README.md"
 requires-python = "==3.11.*"
 dependencies = [
+    "av>=17.0.0",
     "fastapi>=0.135.2",
     "fishjam-server-sdk[gemini]>=0.25.0",
     "google-cloud-texttospeech>=2.0.0",
