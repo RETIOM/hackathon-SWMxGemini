@@ -20,3 +20,5 @@ class MediaChunk:
     
     # Appended raw audio track spanning this 5-second chunk block
     raw_audio_bytes: Optional[bytes] = None
+    audio_sample_rate: int = 48000   # Source sample rate from PyAV
+    audio_channels: int = 2          # Number of audio channels

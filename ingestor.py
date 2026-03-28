@@ -46,8 +46,12 @@ class ChunkingIngestor:
                 return
 
             streams = [v_stream]
+            audio_rate = 48000
+            audio_channels = 2
             if a_stream:
                 streams.append(a_stream)
+                audio_rate = a_stream.rate
+                audio_channels = a_stream.channels
 
             start_wall_time = time.time()
             current_chunk_start = 0.0
@@ -77,7 +81,9 @@ class ChunkingIngestor:
                                 end_time=round(current_chunk_start + self.chunk_duration, 3),
                                 raw_video_frames=accumulated_video_frames,
                                 compressed_frames=accumulated_jpegs,
-                                raw_audio_bytes=b"".join(accumulated_audio_frames) if accumulated_audio_frames else None
+                                raw_audio_bytes=b"".join(accumulated_audio_frames) if accumulated_audio_frames else None,
+                                audio_sample_rate=audio_rate,
+                                audio_channels=audio_channels
                             )
                             
                             # Simulate a live In-Real-Time (IRT) WebRTC/RTSP stream feed
@@ -117,7 +123,9 @@ class ChunkingIngestor:
                      end_time=round(current_chunk_start + self.chunk_duration, 3),
                      raw_video_frames=accumulated_video_frames,
                      compressed_frames=accumulated_jpegs,
-                     raw_audio_bytes=b"".join(accumulated_audio_frames) if accumulated_audio_frames else None
+                     raw_audio_bytes=b"".join(accumulated_audio_frames) if accumulated_audio_frames else None,
+                     audio_sample_rate=audio_rate,
+                     audio_channels=audio_channels
                  )
                  
                  if self.simulate_realtime:
