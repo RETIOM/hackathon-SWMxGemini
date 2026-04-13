@@ -7,7 +7,6 @@ import sys
 
 import numpy as np
 
-# Make src/ importable for tests when pytest runs from repository root.
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
