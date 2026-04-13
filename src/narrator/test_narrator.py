@@ -23,11 +23,6 @@ from narrator.narrator import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _make_audio_bytes(duration_ms: int, freq: int = 440) -> bytes:
     """Generate MP3 bytes of a sine wave with a given duration."""
     tone = Sine(freq).to_audio_segment(duration=duration_ms)
@@ -50,11 +45,6 @@ def _make_narrator() -> StreamingAINarrator:
         return StreamingAINarrator(project_id="test-project")
 
 
-# ---------------------------------------------------------------------------
-# Sync Engine Tests
-# ---------------------------------------------------------------------------
-
-
 class TestSyncAudioDuration:
     """Tests for _sync_audio_duration (pure pydub logic, no mocking)."""
 
@@ -73,7 +63,6 @@ class TestSyncAudioDuration:
 
         result = narrator._sync_audio_duration(ok_audio)
 
-        # Should return the original bytes since within tolerance
         assert result == ok_audio
 
     def test_overflow_speeds_up(self) -> None:
@@ -83,15 +72,8 @@ class TestSyncAudioDuration:
         result = narrator._sync_audio_duration(long_audio)
         duration = _audio_duration_ms(result)
 
-        # After speedup, should be closer to target (pydub speedup isn't exact)
         assert duration < 7000
-        # Reasonably close to target — pydub speedup is approximate
         assert duration < DEFAULT_TARGET_DURATION_MS + 500
-
-
-# ---------------------------------------------------------------------------
-# Silent Fallback Tests
-# ---------------------------------------------------------------------------
 
 
 class TestSilentFallback:
@@ -110,14 +92,8 @@ class TestSilentFallback:
 
         result = narrator._generate_silent_audio()
 
-        # Should parse without exception
         audio = AudioSegment.from_file(io.BytesIO(result), format="mp3")
         assert audio.channels >= 1
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator Tests (mocked API clients)
-# ---------------------------------------------------------------------------
 
 
 class TestProcessChunk:
@@ -125,9 +101,7 @@ class TestProcessChunk:
 
     def test_timeout_returns_silent_audio(self) -> None:
         narrator = _make_narrator()
-        narrator._generate_description = AsyncMock(
-            side_effect=asyncio.TimeoutError()
-        )
+        narrator._generate_description = AsyncMock(side_effect=asyncio.TimeoutError())
 
         result = asyncio.run(narrator.process_chunk([b"fake_jpeg"]))
 
@@ -139,9 +113,7 @@ class TestProcessChunk:
     def test_context_resets_after_max_failures(self) -> None:
         narrator = _make_narrator()
         narrator._previous_context = "some old context"
-        narrator._generate_description = AsyncMock(
-            side_effect=asyncio.TimeoutError()
-        )
+        narrator._generate_description = AsyncMock(side_effect=asyncio.TimeoutError())
 
         for _ in range(MAX_CONSECUTIVE_FAILURES):
             asyncio.run(narrator.process_chunk([b"fake_jpeg"]))
@@ -153,9 +125,7 @@ class TestProcessChunk:
         narrator = _make_narrator()
         narrator._consecutive_failures = 2
         narrator._generate_description = AsyncMock(return_value="A person walks")
-        narrator._generate_tts = AsyncMock(
-            return_value=_make_audio_bytes(4500)
-        )
+        narrator._generate_tts = AsyncMock(return_value=_make_audio_bytes(4500))
 
         result = asyncio.run(narrator.process_chunk([b"fake_jpeg"]))
 
@@ -166,9 +136,7 @@ class TestProcessChunk:
     def test_tts_timeout_returns_silent(self) -> None:
         narrator = _make_narrator()
         narrator._generate_description = AsyncMock(return_value="Walking fast")
-        narrator._generate_tts = AsyncMock(
-            side_effect=asyncio.TimeoutError()
-        )
+        narrator._generate_tts = AsyncMock(side_effect=asyncio.TimeoutError())
 
         result = asyncio.run(narrator.process_chunk([b"fake_jpeg"]))
 

@@ -5,7 +5,6 @@ import sys
 
 import numpy as np
 
-# Make src/ importable for tests when pytest runs from repository root.
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -18,7 +17,6 @@ from synchronizer import Synchronizer
 def test_decode_chunk_audio_applies_ducking_masks() -> None:
     sync = Synchronizer()
 
-    # 8 stereo samples, constant amplitude.
     audio = np.full((8, 2), 0.8, dtype=np.float32)
     chunk = MediaChunk(
         start_time=0.0,
@@ -41,7 +39,6 @@ def test_decode_chunk_audio_applies_ducking_masks() -> None:
     assert mixed is not None
     raw = mixed.raw_data or b""
     pcm = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2)
-    # First half should be attenuated relative to second half.
     first_half_peak = np.max(np.abs(pcm[:4]))
     second_half_peak = np.max(np.abs(pcm[4:]))
     assert first_half_peak < second_half_peak

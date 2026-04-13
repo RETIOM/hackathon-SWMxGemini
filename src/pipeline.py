@@ -16,7 +16,6 @@ import sys
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Literal, cast
 
-# Ensure sibling packages are importable
 _src_dir = str(pathlib.Path(__file__).resolve().parent)
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
@@ -61,7 +60,6 @@ class DescribedVideoPipeline:
 
                 if chunk is None:
                     logger.info("End-of-stream sentinel received.")
-                    # Flush the final sync task
                     if sync_task:
                         segment = await sync_task
                         if self.output_mode == "segmented":
@@ -72,10 +70,8 @@ class DescribedVideoPipeline:
                             segments.append(segment)
                     break
 
-                # Start Gemini for CURRENT chunk immediately
                 model_task = asyncio.create_task(self._process_chunk_models(chunk))
 
-                # While Gemini runs, wait for PREVIOUS chunk's synchronizer to finish and yield it
                 if sync_task:
                     segment = await sync_task
                     if self.output_mode == "segmented":
@@ -85,10 +81,8 @@ class DescribedVideoPipeline:
                     else:
                         segments.append(segment)
 
-                # Now wait for CURRENT chunk's Gemini to finish
                 narrator_result, vap_masks = await model_task
 
-                # Start the synchronizer for CURRENT chunk in background
                 sync_task = asyncio.create_task(
                     asyncio.to_thread(
                         self.synchronizer.process,
@@ -100,7 +94,9 @@ class DescribedVideoPipeline:
                 pending_text = narrator_result.text
 
             if self.output_mode == "single_file":
-                final_mp4 = await asyncio.to_thread(self.synchronizer.concat_segments, segments)
+                final_mp4 = await asyncio.to_thread(
+                    self.synchronizer.concat_segments, segments
+                )
                 if final_mp4:
                     yield final_mp4
         finally:
@@ -117,7 +113,9 @@ class DescribedVideoPipeline:
         )
 
         if isinstance(narrator_res, Exception):
-            logger.warning("Narrator failed for chunk; using silent fallback", exc_info=True)
+            logger.warning(
+                "Narrator failed for chunk; using silent fallback", exc_info=True
+            )
             narrator_res = self._silent_result()
 
         if isinstance(vap_res, Exception):
@@ -197,15 +195,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Described video pipeline")
     parser.add_argument("video_file", help="Path to the input video file")
     parser.add_argument("--project-id", default="swmxgemini", help="GCP project ID")
-    parser.add_argument("--output-dir", default="pipeline_output", help="Output directory")
+    parser.add_argument(
+        "--output-dir", default="pipeline_output", help="Output directory"
+    )
     parser.add_argument(
         "--output-mode",
         choices=["segmented", "single_file"],
         default="segmented",
         help="Output mode: chunk segments or one final file",
     )
-    parser.add_argument("--chunk-duration", type=float, default=10.0, help="Chunk duration in seconds")
-    parser.add_argument("--realtime", action="store_true", help="Simulate real-time ingestion")
+    parser.add_argument(
+        "--chunk-duration", type=float, default=10.0, help="Chunk duration in seconds"
+    )
+    parser.add_argument(
+        "--realtime", action="store_true", help="Simulate real-time ingestion"
+    )
     args = parser.parse_args()
 
     logging.basicConfig(

@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 import sys
 import pathlib
 
-# Ensure the ingestor package is importable (sibling package under src/)
 _src_dir = str(pathlib.Path(__file__).resolve().parent.parent)
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
@@ -29,10 +28,6 @@ from google.genai import types as genai_types
 from pydub import AudioSegment
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Types
-# ---------------------------------------------------------------------------
 
 from typing import TypeAlias
 
@@ -56,13 +51,9 @@ class NarratorResult:
     """The generated description, or empty string on failure."""
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 MAX_CONSECUTIVE_FAILURES: int = 3
-VISION_TIMEOUT: float = 10.0  # seconds
-TTS_TIMEOUT: float = 4.0  # seconds
+VISION_TIMEOUT: float = 10.0
+TTS_TIMEOUT: float = 4.0
 
 DEFAULT_TARGET_DURATION_MS: int = 10000
 DURATION_TOLERANCE_MS: int = 50
@@ -79,10 +70,6 @@ VISION_PROMPT_TEMPLATE: str = (
     "CRITICAL: Write AT MOST 30 words."
     "Focus only on physical movement."
 )
-
-# ---------------------------------------------------------------------------
-# StreamingAINarrator
-# ---------------------------------------------------------------------------
 
 
 class StreamingAINarrator:
@@ -106,18 +93,15 @@ class StreamingAINarrator:
     ) -> None:
         self._target_duration_ms = target_duration_ms
 
-        # State
         self._previous_context: str = ""
         self._consecutive_failures: int = 0
 
-        # Gemini client (google-genai SDK)
         self._genai_client = genai.Client(
             vertexai=True,
             project=project_id,
             location=location,
         )
 
-        # TTS client
         self._tts_client = texttospeech_v1.TextToSpeechAsyncClient()
 
         logger.info(
@@ -135,7 +119,6 @@ class StreamingAINarrator:
         """
         logger.info("Warming up API connections...")
 
-        # Warm up Gemini
         try:
             await self._genai_client.aio.models.generate_content(
                 model=GEMINI_MODEL,
@@ -145,7 +128,6 @@ class StreamingAINarrator:
         except Exception as e:
             logger.warning("Gemini warmup failed (non-fatal): %s", e)
 
-        # Warm up TTS
         try:
             await self._tts_client.synthesize_speech(
                 input=texttospeech_v1.SynthesisInput(text="OK"),
@@ -160,10 +142,6 @@ class StreamingAINarrator:
             logger.info("TTS warmup complete.")
         except Exception as e:
             logger.warning("TTS warmup failed (non-fatal): %s", e)
-
-    # ------------------------------------------------------------------
-    # Phase 1 — Vision AI
-    # ------------------------------------------------------------------
 
     async def _generate_description(self, frames: JpegFrames) -> str:
         """Send frames to Gemini and return a short action description.
@@ -184,7 +162,7 @@ class StreamingAINarrator:
         ]
 
         context_clause = (
-            f"Previous context: \"{self._previous_context}\". "
+            f'Previous context: "{self._previous_context}". '
             if self._previous_context
             else ""
         )
@@ -197,10 +175,8 @@ class StreamingAINarrator:
             contents=contents,
         )
 
-        # Free frame references as early as possible.
         del frames, image_parts
 
-        # Safety filter check
         if not response.text:
             reason = (
                 response.candidates[0].finish_reason
@@ -212,10 +188,6 @@ class StreamingAINarrator:
         text = response.text.strip()
         logger.debug("Vision description: %s", text)
         return text
-
-    # ------------------------------------------------------------------
-    # Phase 2 — Text-to-Speech
-    # ------------------------------------------------------------------
 
     async def _generate_tts(self, text: str) -> bytes:
         """Convert *text* to MP3 speech audio.
@@ -247,10 +219,6 @@ class StreamingAINarrator:
         logger.debug("TTS returned %d bytes", len(response.audio_content))
         return response.audio_content
 
-    # ------------------------------------------------------------------
-    # Phase 3 — Synchronisation Engine
-    # ------------------------------------------------------------------
-
     def _sync_audio_duration(self, audio_bytes: bytes) -> bytes:
         """Fit *audio_bytes* to exactly ``target_duration_ms``.
 
@@ -269,7 +237,9 @@ class StreamingAINarrator:
         target = self._target_duration_ms
 
         if abs(duration - target) <= DURATION_TOLERANCE_MS:
-            logger.debug("Audio duration %dms within tolerance, no adjustment", duration)
+            logger.debug(
+                "Audio duration %dms within tolerance, no adjustment", duration
+            )
             return audio_bytes
 
         if duration < target:
@@ -293,10 +263,6 @@ class StreamingAINarrator:
         audio.export(buffer, format="mp3")
         return buffer.getvalue()
 
-    # ------------------------------------------------------------------
-    # Silent Fallback
-    # ------------------------------------------------------------------
-
     def _generate_silent_audio(self) -> bytes:
         """Return exactly ``target_duration_ms`` of silence as MP3.
 
@@ -310,14 +276,8 @@ class StreamingAINarrator:
         silence.export(buffer, format="mp3")
         return buffer.getvalue()
 
-    # ------------------------------------------------------------------
-    # Frame Sampling
-    # ------------------------------------------------------------------
-
     @staticmethod
-    def _sample_frames(
-        frames: JpegFrames, n: int = DEFAULT_SAMPLE_COUNT
-    ) -> JpegFrames:
+    def _sample_frames(frames: JpegFrames, n: int = DEFAULT_SAMPLE_COUNT) -> JpegFrames:
         """Select *n* evenly-spaced frames from *frames*.
 
         If there are fewer than *n* frames available, all are returned.
@@ -327,10 +287,6 @@ class StreamingAINarrator:
             return frames
         step = total / n
         return [frames[int(i * step)] for i in range(n)]
-
-    # ------------------------------------------------------------------
-    # Main Orchestrator
-    # ------------------------------------------------------------------
 
     async def process_chunk(self, frames: JpegFrames) -> NarratorResult:
         """Process a batch of JPEG frames into narration audio.
@@ -346,23 +302,19 @@ class StreamingAINarrator:
             A :class:`NarratorResult` with fitted audio and description text.
         """
         try:
-            # Phase 1 — Vision
             text = await asyncio.wait_for(
                 self._generate_description(frames),
                 timeout=VISION_TIMEOUT,
             )
 
-            # State update on successful vision
             self._previous_context = text
             self._consecutive_failures = 0
 
-            # Phase 2 — TTS
             raw_audio = await asyncio.wait_for(
                 self._generate_tts(text),
                 timeout=TTS_TIMEOUT,
             )
 
-            # Phase 3 — Sync
             fitted_audio = self._sync_audio_duration(raw_audio)
 
             logger.info("Chunk processed: '%s'", text)

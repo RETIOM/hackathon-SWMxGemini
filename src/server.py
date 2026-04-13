@@ -10,7 +10,6 @@ import uuid
 import pathlib
 from typing import AsyncGenerator
 
-# Ensure sibling packages are importable
 _src_dir = str(pathlib.Path(__file__).resolve().parent)
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
@@ -30,7 +29,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="SWM Gemini Video Streaming API")
 
-# Allow CORS for local React dev server
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -48,7 +46,6 @@ async def sse_event(event_type: str, data: dict) -> str:
 @app.post("/api/process")
 async def process_video(file: UploadFile = File(...)):
     """Accept an MP4 file and stream described fragments back via SSE."""
-    # Write uploaded file to temp file
     ext = os.path.splitext(file.filename or "")[1] or ".mp4"
     temp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}{ext}")
     with open(temp_path, "wb") as f:
@@ -57,7 +54,6 @@ async def process_video(file: UploadFile = File(...)):
     async def event_stream() -> AsyncGenerator[str, None]:
         yield await sse_event("status", {"message": "Initializing pipeline..."})
         try:
-            # Init components
             ingestor = ChunkingIngestor(
                 video_path=temp_path,
                 chunk_duration=10.0,
@@ -75,12 +71,11 @@ async def process_video(file: UploadFile = File(...)):
             )
 
             chunk_idx = 0
-            # pipeline.run() yields (segment_bytes, narration_text) in this mode
             async for payload in pipeline.run():
                 chunk_idx += 1
                 segment_bytes, text = payload
                 b64_data = base64.b64encode(segment_bytes).decode("utf-8")
-                
+
                 yield await sse_event(
                     "segment",
                     {
@@ -91,14 +86,13 @@ async def process_video(file: UploadFile = File(...)):
                 )
 
             yield await sse_event("done", {"total_chunks": chunk_idx})
-            
+
         except asyncio.CancelledError:
             logger.info("Client disconnected, pipeline cancelled.")
         except Exception as e:
             logger.error("Pipeline error", exc_info=True)
             yield await sse_event("error", {"message": str(e)})
         finally:
-            # Cleanup
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 

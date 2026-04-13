@@ -3,6 +3,7 @@ Combined test: verifies both per-frame VAP mask creation and chunk JSON serializ
 Processes a few blocks from input.mp4, checks mask integrity, and saves
 each chunk as a JSON file with embedded masks alongside the frame/audio bytestreams.
 """
+
 import os
 import json
 import base64
@@ -10,14 +11,18 @@ from ingestor import ChunkingIngestor
 from vap import VAP
 
 OUTPUT_DIR = "chunk_outputs"
-VIDEO_FILE = "/home/mateusz/Downloads/594249580_25246747415017303_8710433012125806941_n.mp4"
-MAX_BLOCKS = 2  # Process first 2 blocks for fast testing
+VIDEO_FILE = (
+    "/home/mateusz/Downloads/594249580_25246747415017303_8710433012125806941_n.mp4"
+)
+MAX_BLOCKS = 2
 
 
 def test_mask_and_save():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    ingestor = ChunkingIngestor(video_path=VIDEO_FILE, chunk_duration=5.0, simulate_realtime=False)
+    ingestor = ChunkingIngestor(
+        video_path=VIDEO_FILE, chunk_duration=5.0, simulate_realtime=False
+    )
     vap = VAP(strategy="rms")
 
     ingestor.start()
@@ -34,20 +39,20 @@ def test_mask_and_save():
             num_frames = len(chunk.raw_video_frames)
             num_jpegs = len(chunk.compressed_frames)
 
-            # ── Mask creation tests ──────────────────────────────────
             masks = vap.process_chunk(chunk)
 
-            # 1. One mask per frame
             assert len(masks) == num_frames, (
                 f"Block {block_num}: mask count {len(masks)} != frame count {num_frames}"
             )
 
-            # 2. Every mask value is a valid float in [0, 1]
             for i, m in enumerate(masks):
-                assert isinstance(m, float), f"Block {block_num}, frame {i}: mask is not float"
-                assert 0.0 <= m <= 1.0, f"Block {block_num}, frame {i}: mask {m} out of range"
+                assert isinstance(m, float), (
+                    f"Block {block_num}, frame {i}: mask is not float"
+                )
+                assert 0.0 <= m <= 1.0, (
+                    f"Block {block_num}, frame {i}: mask {m} out of range"
+                )
 
-            # 3. JPEG count matches frame count
             assert num_jpegs == num_frames, (
                 f"Block {block_num}: jpeg count {num_jpegs} != frame count {num_frames}"
             )
@@ -55,7 +60,6 @@ def test_mask_and_save():
             ducking = sum(1 for m in masks if m < 1.0)
             print(f"✓ Block {block_num} masks: {num_frames} frames, {ducking} ducking")
 
-            # ── Chunk saving test ────────────────────────────────────
             payload = {
                 "block_id": block_num,
                 "start_time": chunk.start_time,
@@ -77,21 +81,17 @@ def test_mask_and_save():
             with open(json_path, "w") as f:
                 json.dump(payload, f)
 
-            # 4. File was written and is valid JSON
             assert os.path.exists(json_path), f"Block {block_num}: JSON file missing"
             with open(json_path, "r") as f:
                 loaded = json.load(f)
 
-            # 5. Round-trip integrity: counts match
             assert loaded["frame_count"] == num_frames
             assert len(loaded["frames"]) == num_frames
             assert len(loaded["masks"]) == num_frames
 
-            # 6. Verify a JPEG can be decoded back from base64
             first_jpg = base64.b64decode(loaded["frames"][0])
             assert first_jpg[:2] == b"\xff\xd8", "First frame is not a valid JPEG"
 
-            # 7. Verify audio round-trip (if present)
             if loaded["audio"]:
                 audio_bytes = base64.b64decode(loaded["audio"])
                 assert len(audio_bytes) == len(chunk.raw_audio_bytes)
